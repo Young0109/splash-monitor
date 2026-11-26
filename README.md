@@ -170,7 +170,7 @@ in-process only and reset when the monitor quits.
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v    # 30 unit tests, no GUI/engine needed
+python -m unittest discover -s tests -v    # 59 unit tests, no GUI/engine needed
 ```
 
 CI (GitHub Actions) runs the test suite and builds the bundle on

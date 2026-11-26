@@ -25,7 +25,7 @@ First public release.
 - CLI snapshot mode: `--cli`.
 - `build_app.sh` produces a self-contained `Splash Monitor.app`
   (PyInstaller; requires Tcl/Tk ≥ 8.6.8 — the script enforces it).
-- 30 stdlib unit tests; CI builds and tests on macOS runners.
+- 59 stdlib unit tests; CI builds and tests on macOS runners.
 
 Known limitations:
 - GPU utilization is system-wide (no public per-process API on Apple
@@ -34,5 +34,17 @@ Known limitations:
 - GUI verified on one M5 Max machine / recent macOS; other M-series
   configurations share the same code paths but are untested.
 
-Asset to attach once published: `dist/Splash Monitor.app` (zip).
+Distribution asset: after CI builds the bundle, package it with
+macOS-native `ditto` (as CI does — never upload the raw `.app` directory,
+which loses Unix exec bits and symlink semantics):
+
+```sh
+ditto -c -k --keepParent "dist/Splash Monitor.app" \
+      "Splash-Monitor-v1.0.0-macos-arm64.zip"
+# verify the round-trip before publishing:
+ditto -x -k Splash-Monitor-v1.0.0-macos-arm64.zip /tmp/check
+codesign --verify --deep --strict "/tmp/check/Splash Monitor.app"
+```
+
+Attach `Splash-Monitor-v1.0.0-macos-arm64.zip` to the GitHub Release.
 Note: bundle is ad-hoc signed, not notarized.

@@ -604,6 +604,24 @@ def draw_area(cv, hist, edge, fill, vmax=None):
 
 # ---------------- GUI ----------------
 
+def bench_display(s):
+    """Benchmark 状态栏渲染逻辑(纯函数): 返回 (按钮文本, 状态文本)。
+    优先级: 进行中 > 有结果(完成/部分, 带时间戳) > 失败原因 > 尚未压测。
+    与引擎在线/离线状态无关 —— 断线导致的压测失败同样要显示出来。"""
+    if s.get("bench_running"):
+        extra = f"  {s['bench_status']}" if s.get("bench_status") else ""
+        return "⏳ 压测中…", "压测进行中, 其他请求会排队" + extra
+    if s.get("bench_ts"):
+        return "▶ Benchmark", (f"{s.get('bench_status', '')}  "
+                               f"TG {fmt(s.get('bench_decode_tps'))}  "
+                               f"PP {fmt(s.get('bench_prefill_tps'), '{:.0f}')}  "
+                               f"TTFT {fmt(s.get('bench_ttft_ms'), '{:.0f}')}ms")
+    if s.get("bench_status"):
+        # 首轮即失败/断线导致失败(无成功时间戳): 原因必须显示, 不能沉默
+        return "▶ Benchmark", str(s["bench_status"])
+    return "▶ Benchmark", ""
+
+
 def gui_mode(base):
     import tkinter as tk
 
@@ -770,19 +788,11 @@ def gui_mode(base):
             g_sub.config(text="")
             draw_line(g_cv, s["hist_gpu"], ACCENT[3], vmax=100)
 
-            if s.get("bench_running"):
-                bench_btn.config(text="⏳ 压测中…", fg=DIM)
-                bench_lbl.config(text="压测进行中, 其他请求会排队" + (f"  {s.get('bench_status')}" if s.get("bench_status") else ""))
-            else:
-                bench_btn.config(text="▶ Benchmark", fg=TXT)
-                if s.get("bench_ts"):
-                    bench_lbl.config(text=f"{s.get('bench_status','')}  "
-                                          f"TG {fmt(s.get('bench_decode_tps'))}  "
-                                          f"PP {fmt(s.get('bench_prefill_tps'), '{:.0f}')}  "
-                                          f"TTFT {fmt(s.get('bench_ttft_ms'), '{:.0f}')}ms")
-                elif s.get("bench_status"):
-                    # 首轮即失败(无成功时间戳): 失败原因也必须显示出来, 不能沉默
-                    bench_lbl.config(text=s["bench_status"])
+        # Benchmark 状态栏与引擎在线/离线无关, 每拍渲染: 断线时的压测
+        # 失败/进行中状态也必须可见, 不被在线分支跳过(见 bench_display)。
+        btn, lbl = bench_display(s)
+        bench_btn.config(text=btn, fg=DIM if s.get("bench_running") else TXT)
+        bench_lbl.config(text=lbl)
         root.after(1000, refresh)
 
     root.after(1000, refresh)

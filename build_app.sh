@@ -32,16 +32,34 @@ if [ ! -d "$VENV" ]; then
   "$VENV/bin/pip" install --quiet --upgrade pip pyinstaller
 fi
 
-echo "==> Checking bundled Tcl/Tk version"
+echo "==> Checking bundled Tcl/Tk version (minimum 8.6.8)"
 "$VENV/bin/python" - <<'EOF'
-import sys, _tkinter
-v = _tkinter.TK_VERSION
-print("    Tcl/Tk:", _tkinter.TCL_VERSION, "/", v)
-parts = [int(x) for x in v.split(".")[:2]]
-if parts < [8, 6]:
-    sys.exit("ERROR: Tk %s is too old (Canvas renders blank on modern macOS).\n"
-             "Re-run with PY=<python backed by Tk 8.6.8+/9.x>, e.g. the "
-             "python.org installer build." % v)
+import re, sys, _tkinter
+# _tkinter.TK_VERSION only reports major.minor ("8.6", "9.0"); the patch
+# level must come from the Tk interpreter itself ("info patchlevel").
+patch = None
+try:
+    import tkinter
+    _r = tkinter.Tk()
+    patch = _r.tk.call("info", "patchlevel")
+    _r.destroy()
+except Exception:
+    pass
+ref = patch or _tkinter.TK_VERSION
+nums = [int(x) for x in re.findall(r"\d+", ref)[:3]]
+print("    Tcl/Tk:", _tkinter.TCL_VERSION, "/", _tkinter.TK_VERSION,
+      "patchlevel:", patch if patch else "unavailable")
+if len(nums) >= 3:                                  # full major/minor/patch check
+    if nums[:3] < [8, 6, 8]:
+        sys.exit("ERROR: Tk %s is below the minimum 8.6.8 "
+                 "(older Tk Canvas rendering is blank on modern macOS; "
+                 "Tk 9.x is fully supported). Re-run with "
+                 "PY=<python backed by Tk 8.6.8+/9.x>, e.g. the python.org "
+                 "installer build." % ref)
+elif nums < [8, 6]:
+    sys.exit("ERROR: Tk %s is too old (minimum 8.6.8; Tk 9.x supported)." % ref)
+else:
+    print("    WARNING: patch level unavailable; assuming >= 8.6.8")
 EOF
 
 echo "==> Building"

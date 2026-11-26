@@ -577,8 +577,8 @@ class TestBenchmarkOutcomes(unittest.TestCase):
     def test_gui_shows_failure_without_timestamp(self):
         import inspect
         src = inspect.getsource(sm.gui_mode)
-        # bench_ts 为空时, bench_status(失败原因)也必须有渲染分支
-        self.assertIn('elif s.get("bench_status")', src)
+        # 状态栏渲染统一走 bench_display(纯函数), 不再内联在在线分支里
+        self.assertIn("bench_display(s)", src)
 
 
 class TestReleaseHygiene(unittest.TestCase):
@@ -597,3 +597,62 @@ class TestReleaseHygiene(unittest.TestCase):
         src = inspect.getsource(sm.gui_mode)
         self.assertIn('title("Splash Monitor v1.0.0")', src)
         self.assertNotIn("v2", src.split("mainloop")[0].split("title")[1][:80])
+
+
+class TestBenchDisplay(unittest.TestCase):
+    """P2: 状态栏渲染逻辑(bench_display)不依赖引擎在线状态, 直接验证真实渲染输出。"""
+
+    FAIL_TXT = "压测失败: URLError: 模拟断线"
+    DONE_TXT = "压测完成 12:00:00"
+
+    def test_online_benchmark_success(self):
+        btn, lbl = sm.bench_display({
+            "status": "ok", "bench_ts": 1.0, "bench_status": self.DONE_TXT,
+            "bench_decode_tps": 100.0, "bench_prefill_tps": 4000.0, "bench_ttft_ms": 250.0})
+        self.assertEqual(btn, "▶ Benchmark")
+        self.assertIn("压测完成", lbl)
+        self.assertIn("TG 100", lbl)
+
+    def test_offline_failure_is_rendered(self):
+        # 引擎离线 + 压测失败: 失败原因必须渲染(原 bug: 在线分支内, 断线不显示)
+        btn, lbl = sm.bench_display({"status": "连不上 http://x (URLError)",
+                                     "bench_status": self.FAIL_TXT, "bench_ts": None})
+        self.assertEqual(lbl, self.FAIL_TXT)
+
+    def test_offline_running_is_rendered(self):
+        btn, lbl = sm.bench_display({"status": "连不上 http://x (URLError)",
+                                     "bench_running": True})
+        self.assertEqual(btn, "⏳ 压测中…")
+        self.assertIn("压测进行中", lbl)
+
+    def test_first_round_failure(self):
+        btn, lbl = sm.bench_display({"status": "ok", "bench_status": self.FAIL_TXT})
+        self.assertEqual(lbl, self.FAIL_TXT)
+
+    def test_recovery_after_outage(self):
+        state = {"status": "连不上", "bench_status": self.FAIL_TXT, "bench_ts": None}
+        self.assertEqual(sm.bench_display(state)[1], self.FAIL_TXT)   # 断线: 显示失败
+        state.update({"status": "ok", "bench_status": self.DONE_TXT, "bench_ts": 9.9,
+                      "bench_decode_tps": 88.0, "bench_prefill_tps": 3000.0,
+                      "bench_ttft_ms": 300.0})
+        self.assertIn("压测完成", sm.bench_display(state)[1])          # 恢复: 回到结果行
+
+    def test_running_wins_over_old_results(self):
+        btn, lbl = sm.bench_display({"bench_running": True, "bench_ts": 1.0,
+                                     "bench_status": self.DONE_TXT,
+                                     "bench_decode_tps": 100.0})
+        self.assertEqual(btn, "⏳ 压测中…")
+        self.assertIn("压测进行中", lbl)
+        self.assertNotIn("TG 100", lbl)                                # 旧数字不盖住进行中
+
+    def test_never_benchmarked_is_empty(self):
+        btn, lbl = sm.bench_display({"status": "ok"})
+        self.assertEqual(btn, "▶ Benchmark")
+        self.assertEqual(lbl, "")                                      # 保持原有初始空白行为
+
+    def test_render_hook_is_outside_online_branch(self):
+        import inspect
+        src = inspect.getsource(sm.gui_mode)
+        # 结构守卫: 渲染调用在 refresh 函数体层级(8 空格), 不在 if/else 分支内
+        self.assertIn("\n        btn, lbl = bench_display(s)", src)
+        self.assertNotIn("⏳ 压测中…", src)                             # 旧内联分支已移除

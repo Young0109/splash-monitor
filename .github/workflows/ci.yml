@@ -12,10 +12,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Runner sanity (arm64 + Tk >= 8.6)
+      - name: Runner sanity (arm64 + Tk >= 8.6.8)
         run: |
           [ "$(uname -m)" = "arm64" ] || { echo "FAIL: runner is not arm64"; exit 1; }
-          python -c 'import sys, _tkinter; v=[int(x) for x in _tkinter.TK_VERSION.split(".")[:2]]; print("Tcl/Tk:", _tkinter.TCL_VERSION, _tkinter.TK_VERSION); sys.exit(0 if v >= [8, 6] else "Tk too old for bundle builds")'
+          python - <<'TKEOF'
+          import re, sys, _tkinter
+          patch = None
+          try:
+              import tkinter
+              r = tkinter.Tk(); patch = r.tk.call("info", "patchlevel"); r.destroy()
+          except Exception:
+              pass
+          ref = patch or _tkinter.TK_VERSION
+          n = [int(x) for x in re.findall(r"\d+", ref)[:3]]
+          print("Tcl/Tk:", _tkinter.TCL_VERSION, "/", _tkinter.TK_VERSION, "patchlevel:", patch)
+          if len(n) >= 3:
+              sys.exit(0 if n[:3] >= [8, 6, 8] else "Tk %s below minimum 8.6.8" % ref)
+          sys.exit(0 if n >= [8, 6] else "Tk %s below minimum 8.6.8 (patch unknown)" % ref)
+          TKEOF
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: CLI degrades gracefully when Splash is down
@@ -51,7 +65,22 @@ jobs:
           if "$APP/Contents/MacOS/Splash Monitor" --url http://127.0.0.1:59999 --cli; then
             echo "FAIL: expected non-zero exit with no engine"; exit 1
           fi
+      - name: Package app with ditto
+        # upload-artifact's directory walk can drop Unix exec bits and
+        # symlink semantics; a macOS-native ditto ZIP preserves the exact
+        # bundle (permissions, symlinks, code signature) for distribution.
+        run: ditto -c -k --keepParent "dist/Splash Monitor.app" "Splash-Monitor-v1.0.0-macos-arm64.zip"
+      - name: ZIP round-trip verification
+        run: |
+          rm -rf /tmp/zipcheck && mkdir -p /tmp/zipcheck
+          ditto -x -k "Splash-Monitor-v1.0.0-macos-arm64.zip" /tmp/zipcheck
+          APP="/tmp/zipcheck/Splash Monitor.app"
+          test -x "$APP/Contents/MacOS/Splash Monitor" || { echo "FAIL: exec bit lost"; exit 1; }
+          src_links=$(find "dist/Splash Monitor.app" -type l | wc -l | tr -d ' ')
+          dst_links=$(find "$APP" -type l | wc -l | tr -d ' ')
+          [ "$src_links" = "$dst_links" ] || { echo "FAIL: symlinks lost ($src_links -> $dst_links)"; exit 1; }
+          codesign --verify --deep --strict "$APP" || { echo "FAIL: signature broken after unzip"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: Splash-Monitor-app
-          path: dist/Splash Monitor.app
+          name: Splash-Monitor-v1.0.0-macos-arm64-zip
+          path: Splash-Monitor-v1.0.0-macos-arm64.zip
