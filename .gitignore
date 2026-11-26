@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.build-venv/
+*.egg-info/
+
+# Build products
+build/
+dist/
+*.spec
+*.iconset/
+
+# macOS
+.DS_Store
+
+# Local / private
+*.log
+.env
+*.private.*

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI degrades gracefully when Splash is down
+        run: |
+          set +e
+          out=$(python splash_monitor.py --url http://127.0.0.1:59999 --cli 2>&1)
+          rc=$?
+          echo "$out"
+          [ $rc -ne 0 ] || { echo "expected non-zero exit"; exit 1; }
+          echo "$out" | grep -q "连不上" || { echo "expected clear unavailable message"; exit 1; }
+
+  build:
+    runs-on: macos-14
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build app bundle
+        env:
+          PY: python3.12
+        run: ./build_app.sh
+      - name: Bundle sanity
+        run: |
+          APP="dist/Splash Monitor.app"
+          test -x "$APP/Contents/MacOS/Splash Monitor"
+          plutil -p "$APP/Contents/Info.plist" | grep -q "Splash Monitor"
+          if ! find "$APP/Contents/Frameworks" -iname "*tcl*" -maxdepth 2 | grep -q .; then
+            echo "FAIL: Tcl/Tk not bundled"; exit 1
+          fi
+          # Frozen binary must degrade gracefully without an engine.
+          if "$APP/Contents/MacOS/Splash Monitor" --url http://127.0.0.1:59999 --cli; then
+            echo "FAIL: expected non-zero exit with no engine"; exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Splash-Monitor-app
+          path: dist/Splash Monitor.app
