@@ -79,22 +79,36 @@ right-click → Open once, or you can sign/notarize it yourself.
 ## What the numbers mean
 
 ### Decode card
-- **Live rate** — `Δ decode_output_tokens_total / Δ decode_wall_milliseconds_total`
+- **Big number** — live rate:
+  `Δ decode_output_tokens_total / Δ decode_wall_milliseconds_total`
   between samples. The denominator is the engine's *own* reported working
   time, not the sampling window: counters commit per batch, and dividing by
   wall-clock window would both under- and over-state throughput depending on
   commit timing. Official counter, labeled *实时*.
-- **官方均值** — lifetime average = `tokens_total / wall_total` since engine start.
-- **Bench TG** — see Benchmark. Live value disappears when data goes stale (> 8 s).
+- **Bench TG** — the latest benchmark decode result, with its method label
+  (*官方阶段差分* / *端到端估算* / *未测*).
+- Missing counters render as `--` with a gap in the graph — a flat zero is
+  only drawn when the counters exist and the engine is genuinely idle.
+
+The CLI snapshot (`--cli`) additionally reports the official **lifetime
+average** (`decode_output_tokens_total / decode_wall_milliseconds_total`,
+both since engine start). Where those totals are absent, it falls back to a
+value derived from `itl_p50_milliseconds` (`1000 / ITL p50`) and labels it
+explicitly as *ITL p50换算参考(非平均值)* — a median-token-interval
+reciprocal is a reference conversion, not an average throughput, and we
+don't present it as one.
 
 ### Prefill card
-Same method over `prefill_input_tokens_total / prefill_wall_milliseconds_total`.
-Shown as *空闲* when no prefill activity is detected in the current window.
+Same method over the prefill counters. Prefill counters commit when a batch
+finishes, so the card shows `···` while a prefill is in flight, holds the
+last batch's rate for ~6 s after it lands, and shows `0` when the engine is
+idle (or `--` if the counters are missing).
 
-### TTFT (on the Prefill card)
+### TTFT
 `ttft_p50/p95_milliseconds` — official engine percentiles, measured over all
-requests since engine start. Benchmark TTFT is measured per run as the time
-until the **first non-empty streamed `content` delta** (role-only chunks
+requests since engine start. They appear in the **CLI snapshot**; in the GUI,
+the bottom result bar shows the **per-run benchmark TTFT**, measured as the
+time until the **first non-empty streamed `content` delta** (role-only chunks
 don't count — that would measure header latency, not first token).
 
 ### Memory card

@@ -6,12 +6,16 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-15            # arm64 generation; previous runner label retired Nov 2026
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Runner sanity (arm64 + Tk >= 8.6)
+        run: |
+          [ "$(uname -m)" = "arm64" ] || { echo "FAIL: runner is not arm64"; exit 1; }
+          python -c 'import sys, _tkinter; v=[int(x) for x in _tkinter.TK_VERSION.split(".")[:2]]; print("Tcl/Tk:", _tkinter.TCL_VERSION, _tkinter.TK_VERSION); sys.exit(0 if v >= [8, 6] else "Tk too old for bundle builds")'
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: CLI degrades gracefully when Splash is down
@@ -24,7 +28,7 @@ jobs:
           echo "$out" | grep -q "连不上" || { echo "expected clear unavailable message"; exit 1; }
 
   build:
-    runs-on: macos-14
+    runs-on: macos-15            # arm64; bundles target Apple Silicon
     needs: test
     steps:
       - uses: actions/checkout@v4

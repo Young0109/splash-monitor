@@ -2,6 +2,7 @@
 
 Run:  python -m unittest discover -s tests -v
 """
+import json
 import os
 import sys
 import threading
@@ -280,3 +281,319 @@ class TestSystemCollectors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =====================================================================
+# Regression tests for pre-release review fixes (P1-1..P1-4, P2-1..P2-4)
+# =====================================================================
+
+class TestAvgRate(unittest.TestCase):
+    """P1-3: lifetime 平均 = 累计 tokens / 累计墙钟; 缺失不得当 0。"""
+
+    def test_basic(self):
+        self.assertAlmostEqual(sm.avg_rate(600, 3000), 200.0)
+
+    def test_real_zero_kept(self):
+        self.assertEqual(sm.avg_rate(0, 1000), 0.0)        # 真实 0 保留
+
+    def test_missing_or_dead_denominator(self):
+        self.assertIsNone(sm.avg_rate(None, 1000))
+        self.assertIsNone(sm.avg_rate(100, None))
+        self.assertIsNone(sm.avg_rate(100, 0))
+        self.assertIsNone(sm.avg_rate(100, -5))
+
+
+class TestCliSemantics(unittest.TestCase):
+    """P1-3: CLI 的"官方均值"必须是累计值换算, ITL 换算只能作标注过的回退。"""
+
+    def test_cli_uses_lifetime_average(self):
+        import inspect
+        src = inspect.getsource(sm.cli_mode)
+        self.assertIn('s.get("dec_avg")', src)
+        self.assertNotIn("官方均值 {fmt(1000/", src)       # 禁止再拿 1000/ITL 冒称均值
+        self.assertIn("ITL p50换算", src)                  # 回退路径存在且明确标注
+
+
+class TestTickDataQuality(unittest.TestCase):
+    """P1-1: HTTP 成功但内容缺失时, 不标 ok / 不造假 0 / 图表断线。"""
+
+    def _collector_with(self, responses):
+        """responses: callable(n) -> metrics text for the n-th /metrics call."""
+        calls = {"n": 0}
+        real = sm.http_text
+
+        def fake(path, base, timeout=5):
+            calls["n"] += 1
+            return responses(calls["n"])
+
+        sm.http_text = fake
+        self.addCleanup(setattr, sm, "http_text", real)
+        return sm.Collector("http://x")
+
+    def test_empty_metrics_not_ok_and_no_fake_zero(self):
+        c = self._collector_with(lambda n: "")
+        c._tick()
+        s = c.snapshot()
+        self.assertNotEqual(s["status"], "ok")
+        self.assertIn("为空", s["status"])
+        self.assertEqual(s["hist_decode"], [None])         # 断线, 不是 0
+        self.assertEqual(s["hist_prefill"], [None])
+
+    def test_partial_missing_only_affects_that_metric(self):
+        seq = ["splash_decode_output_tokens_total 100\nsplash_decode_wall_milliseconds_total 200\n",
+               "splash_decode_output_tokens_total 200\nsplash_decode_wall_milliseconds_total 400\n"]
+        c = self._collector_with(lambda n: seq[min(n - 1, 1)])
+        c._tick()
+        c._tick()
+        s = c.snapshot()
+        self.assertEqual(s["status"], "ok")                # 部分缺失不整体判死
+        self.assertAlmostEqual(s["hist_decode"][1], 500.0)  # 有效指标照常更新
+        self.assertEqual(s["hist_prefill"], [None, None])  # 缺失指标 = None 断线
+        self.assertTrue(s["decode_valid"])
+        self.assertFalse(s["prefill_valid"])
+        self.assertIsNone(s.get("mem_cur"))                # 内存不显示 0
+
+    def test_idle_zero_is_real_and_kept(self):
+        seq = ["splash_decode_output_tokens_total 10\nsplash_decode_wall_milliseconds_total 50\n"] * 2
+        c = self._collector_with(lambda n: seq[min(n - 1, 1)])
+        c._tick()
+        c._tick()
+        s = c.snapshot()
+        self.assertEqual(s["hist_decode"][1], 0.0)         # 计数器在场且无活动 = 真 0
+        self.assertTrue(s["decode_valid"])
+
+    def test_drop_then_recovery(self):
+        state = {"phase": 0}
+
+        def resp(n):
+            if state["phase"] == 0:
+                return "splash_decode_output_tokens_total 100\nsplash_decode_wall_milliseconds_total 200\n"
+            if state["phase"] == 1:
+                return ""                                   # 引擎突然返回空 body
+            return "splash_decode_output_tokens_total 300\nsplash_decode_wall_milliseconds_total 600\n"
+
+        c = self._collector_with(resp)
+        c._tick()
+        state["phase"] = 1
+        c._tick()
+        state["phase"] = 2
+        c._tick()
+        s = c.snapshot()
+        self.assertEqual(s["status"], "ok")                # 恢复后回到 ok
+        self.assertEqual(s["hist_decode"][0], 0.0)
+        self.assertIsNone(s["hist_decode"][1])             # 故障拍 = 断线
+        self.assertAlmostEqual(s["hist_decode"][2], 500.0)  # 恢复: 200tok/0.4s
+        self.assertAlmostEqual(s["dec_avg"], 500.0)
+
+    def test_counters_present_but_empty_otherwise_memory_none(self):
+        c = self._collector_with(lambda n: "splash_requests_completed_total 1\n")
+        c._tick()
+        s = c.snapshot()
+        self.assertEqual(s["status"], "ok")
+        self.assertIsNone(s.get("mem_cur"))
+        self.assertFalse(s["decode_valid"])
+
+
+class TestSnapshotIsolation(unittest.TestCase):
+    """P2-1: snapshot 不得把活动历史列表引用交给 GUI。"""
+
+    def test_history_copied_under_lock(self):
+        c = sm.Collector("http://x")
+        c._tick_i = 0
+        c.state["hist_decode"] = [1.0, 2.0]
+        s = c.snapshot()
+        s["hist_decode"].append(99.0)                      # GUI 侧任意改动
+        self.assertEqual(c.state["hist_decode"], [1.0, 2.0])  # 采集侧不受影响
+
+
+class TestSystemMemMissingFields(unittest.TestCase):
+    """P2-2: vm_stat 缺字段 => used None, 不拿 0 凑总和; 结构仍为三元组。"""
+
+    def _patch(self, vmstat_text):
+        import types
+
+        real = sm.subprocess.run
+
+        def fake(cmd, *a, **kw):
+            if cmd[0].endswith("sysctl"):
+                return types.SimpleNamespace(stdout="68719476736\n")   # 64 GB
+            return types.SimpleNamespace(stdout=vmstat_text)
+
+        sm.subprocess.run = fake
+        self.addCleanup(setattr, sm, "subprocess_run_marker", None)     # no-op guard
+        self.addCleanup(setattr, sm.subprocess, "run", real)
+
+    VM_FULL = ("Mach Virtual Memory Statistics:\n"
+               "Page size of bytes:     16384\n"
+               "Pages free:                             100000\n"
+               "Pages active:                           200000\n"
+               "Pages inactive:                         150000\n"
+               "Pages wired down:                       300000\n"
+               "Pages occupied by compressor:           400000\n")
+
+    def test_all_fields_present(self):
+        self._patch(self.VM_FULL)
+        used, total, ts = sm.system_mem()
+        self.assertAlmostEqual(total, 64.0)
+        self.assertAlmostEqual(used, (300000 + 200000 + 400000) * 16384 / 2**30)
+        self.assertIsNotNone(ts)
+
+    def test_missing_compressor_gives_none(self):
+        self._patch(self.VM_FULL.replace("Pages occupied by compressor:           400000\n", ""))
+        used, total, ts = sm.system_mem()
+        self.assertIsNone(used)                            # 缺项 => None, 不是部分和
+        self.assertAlmostEqual(total, 64.0)                # 结构稳定
+        self.assertIsNotNone(ts)
+
+
+class FakeResp:
+    """Minimal stand-in for urlopen() response: context manager + iterable lines."""
+
+    def __init__(self, body: bytes):
+        self._b = body
+
+    def read(self):
+        return self._b
+
+    def __iter__(self):
+        return iter(self._b.splitlines())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestBenchmarkOutcomes(unittest.TestCase):
+    """P1-2: HTTP 200 != 成功; 成功/部分/失败分类 + 每轮重置 + 锁释放。"""
+
+    SSTREAM_OK = (b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+                  b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+                  b'data: [DONE]\n\n')
+    SSTREAM_EMPTY = (b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+                     b'data: [DONE]\n\n')
+    M_IDLE = "splash_requests_completed_total 5\nsplash_requests_submitted_total 5\n"
+    M_PRE = ["splash_prefill_input_tokens_total 0\nsplash_prefill_wall_milliseconds_total 0\n",
+             "splash_prefill_input_tokens_total 2000\nsplash_prefill_wall_milliseconds_total 500\n"]
+    M_DEC = ["splash_decode_output_tokens_total 10\nsplash_decode_wall_milliseconds_total 100\n",
+             "splash_decode_output_tokens_total 310\nsplash_decode_wall_milliseconds_total 3100\n"]
+    M_NONE = "splash_requests_completed_total 5\n"
+
+    def _patch(self, seq, usage_fn, stream, raise_on=None):
+        real = sm.urllib.request.urlopen
+        calls = {"m": 0, "p": 0}
+
+        def fake(req, timeout=None):
+            url = req.full_url
+            if url.endswith("/metrics"):
+                if raise_on == "metrics":
+                    raise ConnectionError("boom")
+                i = min(calls["m"], len(seq) - 1)
+                calls["m"] += 1
+                return FakeResp(seq[i].encode())
+            payload = json.loads(req.data.decode())
+            if payload.get("stream"):
+                return FakeResp(stream)
+            calls["p"] += 1
+            if raise_on == "post":
+                raise ConnectionError("boom mid-run")
+            usage = usage_fn(payload)
+            body = {"choices": [{"message": {"content": "ok"}}]}
+            if usage is not None:
+                body["usage"] = usage
+            return FakeResp(json.dumps(body).encode())
+
+        sm.urllib.request.urlopen = fake
+        self.addCleanup(setattr, sm.urllib.request, "urlopen", real)
+
+    def _usage_full(self, payload):
+        return {"prompt_tokens": 2000} if payload.get("max_tokens") == 2 else {"completion_tokens": 300}
+
+    def _run(self, got):
+        sm.run_benchmark("http://fake", lambda k, v: got.append((k, v)))
+        return dict(got)
+
+    def test_full_success(self):
+        self._patch([self.M_IDLE] + self.M_PRE + self.M_DEC, self._usage_full, self.SSTREAM_OK)
+        k = self._run([])
+        self.assertTrue(str(k["bench_status"]).startswith("压测完成"), k["bench_status"])
+        self.assertAlmostEqual(k["bench_prefill_tps"], 4000.0)
+        self.assertEqual(k["bench_prefill_mode"], "官方阶段差分")
+        self.assertAlmostEqual(k["bench_decode_tps"], 100.0)
+        self.assertTrue(k["bench_ttft_ms"] > 0)
+        self.assertIsNotNone(k["bench_ts"])
+        self.assertEqual(k["bench_running"], False)
+
+    def test_no_usage_no_counters_is_failure_not_complete(self):
+        self._patch([self.M_NONE], lambda p: {} if p.get("max_tokens") else {}, self.SSTREAM_EMPTY)
+
+        def no_usage(p):
+            return {}
+        self._patch([self.M_NONE], no_usage, self.SSTREAM_EMPTY)
+        k = self._run([])
+        self.assertTrue(str(k["bench_status"]).startswith("压测失败"), k["bench_status"])
+        self.assertNotIn("压测完成", k["bench_status"])
+        self.assertIsNone(k.get("bench_ts"))               # 失败不留"成功时间戳"
+        self.assertIsNone(k.get("bench_prefill_tps"))
+        self.assertIsNone(k.get("bench_decode_tps"))
+        self.assertEqual(k["bench_running"], False)
+
+    def test_partial_success_lists_missing(self):
+        seq = [self.M_IDLE, self.M_NONE, self.M_NONE] + self.M_DEC   # prefill 计数器缺失
+        self._patch(seq, lambda p: (None if p.get("max_tokens") == 2 else {"completion_tokens": 300}),
+                    self.SSTREAM_OK)
+        k = self._run([])
+        self.assertTrue(str(k["bench_status"]).startswith("部分压测完成"), k["bench_status"])
+        self.assertIn("PP 缺数据", k["bench_status"])
+        self.assertAlmostEqual(k["bench_decode_tps"], 100.0)
+        self.assertIsNone(k.get("bench_prefill_tps"))      # 缺数据不虚构吞吐
+
+    def test_previous_results_reset_each_round(self):
+        got = [("bench_decode_tps", 999.0), ("bench_prefill_tps", 888.0),
+               ("bench_decode_mode", "官方阶段差分"), ("bench_ts", 12345.0)]
+        self._patch([self.M_NONE], lambda p: {}, self.SSTREAM_EMPTY)
+        k = self._run(got)
+        self.assertIsNone(k["bench_decode_tps"])           # 旧结果已清
+        self.assertIsNone(k["bench_prefill_tps"])
+        self.assertIsNone(k.get("bench_ts"))
+        self.assertTrue(str(k["bench_status"]).startswith("压测失败"))
+
+    def test_failure_then_retry_success(self):
+        self._patch([self.M_NONE], lambda p: {}, self.SSTREAM_EMPTY)
+        k1 = self._run([])
+        self.assertTrue(str(k1["bench_status"]).startswith("压测失败"))
+        self._patch([self.M_IDLE] + self.M_PRE + self.M_DEC, self._usage_full, self.SSTREAM_OK)
+        k2 = self._run([])
+        self.assertTrue(str(k2["bench_status"]).startswith("压测完成"))
+        self.assertAlmostEqual(k2["bench_decode_tps"], 100.0)
+
+    def test_mid_run_exception_releases_lock(self):
+        self._patch([self.M_IDLE], self._usage_full, self.SSTREAM_OK, raise_on="post")
+        k = self._run([])
+        self.assertEqual(k["bench_running"], False)        # finally 释放
+        self.assertTrue(str(k["bench_status"]).startswith("压测失败"))
+
+    def test_gui_shows_failure_without_timestamp(self):
+        import inspect
+        src = inspect.getsource(sm.gui_mode)
+        # bench_ts 为空时, bench_status(失败原因)也必须有渲染分支
+        self.assertIn('elif s.get("bench_status")', src)
+
+
+class TestReleaseHygiene(unittest.TestCase):
+    """P1-4 / P2-4: CI runner 与版本标识。"""
+
+    def test_no_retired_runner(self):
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         ".github", "workflows", "ci.yml")
+        yml = open(p).read()
+        self.assertNotIn("macos-14", yml)
+        self.assertIn("macos-15", yml)
+        self.assertIn("arm64", yml)                        # 架构显式断言, 不信标签默认
+
+    def test_title_version_matches_release(self):
+        import inspect
+        src = inspect.getsource(sm.gui_mode)
+        self.assertIn('title("Splash Monitor v1.0.0")', src)
+        self.assertNotIn("v2", src.split("mainloop")[0].split("title")[1][:80])

@@ -110,6 +110,19 @@ def rate_from_delta(prev_m, met, tok_key, wall_key):
     return d_tok / max(d_wall, 0.05), True
 
 
+def avg_rate(tok_total, wall_ms_total):
+    """官方 lifetime 平均 = 累计 tokens / 累计引擎墙钟 (tokens/s)。
+    任一输入缺失或墙钟 <= 0 返回 None —— 不把缺失当 0。
+    注意与 ITL p50 换算率 (1000/itl_p50) 的区别: 后者是单 token 间隔
+    中位数的倒数, 只是参考换算值, 不是全体请求的平均吞吐。"""
+    if tok_total is None or wall_ms_total is None:
+        return None
+    w = wall_ms_total / 1000.0
+    if w <= 0:
+        return None
+    return tok_total / w
+
+
 def gpu_stats():
     """系统级 GPU 计数器(所有进程合计), 来自 IORegistry, 免 root。"""
     try:
@@ -137,8 +150,11 @@ def system_mem():
 
         def f(name):
             m = re.search(rf"{name}\s*:\s*(\d+)", raw)
-            return int(m.group(1)) * page / (1 << 30) if m else 0.0
-        used = f("Pages wired down") + f("Pages active") + f("Pages occupied by compressor")
+            return int(m.group(1)) * page / (1 << 30) if m else None
+        parts = [f("Pages wired down"), f("Pages active"),
+                 f("Pages occupied by compressor")]
+        # 任一字段缺失 => used 为 None (不拿假 0 凑总和); 返回三元组结构保持稳定
+        used = sum(parts) if all(p is not None for p in parts) else None
         return used, total, time.time()
     except Exception:
         return None, None, None
@@ -217,6 +233,11 @@ def run_benchmark(base, on_update):
         return body, time.time() - t0
 
     notes = []
+    # 每轮开始先重置上一轮结果: 失败/首轮时 GUI 不会残留旧数字
+    for k in ("bench_ttft_ms", "bench_prefill_tps", "bench_decode_tps",
+              "bench_prefill_mode", "bench_decode_mode", "bench_ts"):
+        on_update(k, None)
+    pre_done = dec_done = False
     try:
         # 0) 等引擎空闲, 避免把别人的请求混进阶段差分 (最多等 10s)
         t_end = time.time() + 10
@@ -277,9 +298,11 @@ def run_benchmark(base, on_update):
         if stage:
             on_update("bench_prefill_tps", stage)
             on_update("bench_prefill_mode", "官方阶段差分")
+            pre_done = True
         elif e2e:
             on_update("bench_prefill_tps", e2e)
             on_update("bench_prefill_mode", "端到端估算")
+            pre_done = True
 
         # 3) Decode: 同样阶段差分为先。
         a = _snap_stage(base, (KEY_DEC_TOKENS, KEY_DEC_WALL))
@@ -297,13 +320,29 @@ def run_benchmark(base, on_update):
         if stage:
             on_update("bench_decode_tps", stage)
             on_update("bench_decode_mode", "官方阶段差分")
+            dec_done = True
         elif e2e:
             on_update("bench_decode_tps", e2e)
             on_update("bench_decode_mode", "端到端估算")
+            dec_done = True
 
-        on_update("bench_ts", time.time())
-        on_update("bench_status", "压测完成 " + time.strftime("%H:%M:%S")
-                  + ((" (" + "; ".join(notes) + ")") if notes else ""))
+        # 成功判定以"拿到可计算的数据"为准, HTTP 200 本身不算成功:
+        # 三项全无 => 失败; 部分缺失 => 部分完成并列出缺项; 三项齐全 => 完成。
+        missing = [n for n, ok in (("TTFT", bool(ttft)), ("PP", pre_done), ("TG", dec_done))
+                   if not ok]
+        if not missing:
+            on_update("bench_ts", time.time())
+            on_update("bench_status", "压测完成 " + time.strftime("%H:%M:%S")
+                      + ((" (" + "; ".join(notes) + ")") if notes else ""))
+        elif len(missing) < 3:
+            on_update("bench_ts", time.time())
+            on_update("bench_status", "部分压测完成 " + time.strftime("%H:%M:%S")
+                      + " (" + ",".join(missing) + " 缺数据"
+                      + ("; " + "; ".join(notes) if notes else "") + ")")
+        else:
+            on_update("bench_status",
+                      "压测失败: 未获得有效结果 (引擎未返回 usage 且无阶段计数器"
+                      + ("; " + "; ".join(notes) if notes else "") + ")")
     except Exception as e:
         on_update("bench_status", f"压测失败: {type(e).__name__}: {e}")
     finally:
@@ -336,8 +375,13 @@ class Collector:
         self._stop = threading.Event()
 
     def snapshot(self):
+        """给 GUI 的一致性快照: 锁内浅拷贝 + 历史列表副本,
+        避免采样线程 append 与 Tk 主线程绘图共用同一 list。"""
         with self.lock:
-            return dict(self.state)
+            s = dict(self.state)
+            for h in ("hist_decode", "hist_prefill", "hist_gpu", "hist_sysmem"):
+                s[h] = list(s.get(h) or [])
+            return s
 
     def update(self, key, val):
         with self.lock:
@@ -360,6 +404,22 @@ class Collector:
         try:
             met = parse_metrics(http_text("/metrics", self.base, timeout=4))
             now = time.time()
+            if not met:
+                # HTTP 成功但 body 为空/不可解析: 不标 ok、不造数据;
+                # 引擎侧历史记 None(图上断线), 系统级历史沿用最近一次采集。
+                with self.lock:
+                    s = self.state
+                    s["status"] = "metrics 为空或不可解析(引擎版本?)"
+                    g = s.get("gpu") or {}
+                    smem = s.get("sysmem")
+                    s["hist_decode"].append(None)
+                    s["hist_prefill"].append(None)
+                    s["hist_gpu"].append(g.get("device"))
+                    s["hist_sysmem"].append(
+                        (smem[0] / smem[1]) if (smem and smem[0] is not None and smem[1]) else None)
+                    for h in ("hist_decode", "hist_prefill", "hist_gpu", "hist_sysmem"):
+                        del s[h][:-90]
+                return
 
             # 引擎重启检测: 单调计数器倒退
             req_done = met.get(KEY_REQ_DONE)
@@ -373,6 +433,9 @@ class Collector:
 
             dec_tps, dec_act = rate_from_delta(self._prev_met, met, KEY_DEC_TOKENS, KEY_DEC_WALL)
             pre_tps, pre_act = rate_from_delta(self._prev_met, met, KEY_PRE_TOKENS, KEY_PRE_WALL)
+            # 计数器在场与否决定"0"是否可信: 在场=真实空闲(0), 缺失=None(断线)
+            dec_ok = KEY_DEC_TOKENS in met and KEY_DEC_WALL in met
+            pre_ok = KEY_PRE_TOKENS in met and KEY_PRE_WALL in met
             self._prev_met, self._prev_t = met, now
 
             if self._tick_i % GPU_EVERY == 1 or self.state.get("gpu") is None:
@@ -394,8 +457,10 @@ class Collector:
                 if pre_tps:
                     s["prefill_last"] = pre_tps
                     s["prefill_last_ts"] = now
-                s["hist_decode"].append(dec_tps or 0)
-                s["hist_prefill"].append(pre_tps or 0)
+                s["hist_decode"].append(dec_tps if dec_tps is not None else (0.0 if dec_ok else None))
+                s["hist_prefill"].append(pre_tps if pre_tps is not None else (0.0 if pre_ok else None))
+                s["decode_valid"] = dec_ok
+                s["prefill_valid"] = pre_ok
                 g = s.get("gpu") or {}
                 s["hist_gpu"].append(g.get("device"))
                 # 系统内存占用比例历史 (0..1); 采集失败记 None → 图上断线, 不画假数据
@@ -407,6 +472,8 @@ class Collector:
                 s["ttft_p50"] = met.get(KEY_TTFT_P50)
                 s["ttft_p95"] = met.get(KEY_TTFT_P95)
                 s["itl_p50"] = met.get(KEY_ITL_P50)
+                s["dec_avg"] = avg_rate(met.get(KEY_DEC_TOKENS), met.get(KEY_DEC_WALL))
+                s["pre_avg"] = avg_rate(met.get(KEY_PRE_TOKENS), met.get(KEY_PRE_WALL))
                 s["accept_ratio"] = met.get(KEY_ACCEPT)
                 s["mem_cur"] = met.get(KEY_MEM_CUR)
                 s["mem_peak"] = met.get(KEY_MEM_PEAK)
@@ -453,14 +520,23 @@ def cli_mode(base):
     sysps = s.get("sysps") or {}
     used, total, _ = s.get("sysmem") or (None, None, None)
     print(f"状态     : ok  引擎时间 {s['ts']}  排队 {fmt(s.get('queued'), '{:.0f}')}")
-    print(f"Decode   : 实时 {fmt(s.get('decode_tps'))} tok/s | 官方均值 {fmt(1000/s['itl_p50'] if s.get('itl_p50') else None)} "
+    # 官方均值 = 累计 tokens / 累计引擎墙钟 (dec_avg)。不可得时回退
+    # ITL p50 换算, 并明确标注为换算参考, 不冒称"平均"。
+    avg = s.get("dec_avg")
+    if avg is None and s.get("itl_p50"):
+        avg_txt = f"ITL p50换算参考 {fmt(1000/s['itl_p50'])} tok/s(非平均值)"
+    else:
+        avg_txt = f"官方均值 {fmt(avg)} tok/s"
+    print(f"Decode   : 实时 {fmt(s.get('decode_tps'))} tok/s | {avg_txt} "
           f"| Benchmark {fmt(s.get('bench_decode_tps'))} [{s.get('bench_decode_mode') or '未测'}]")
     print(f"Prefill  : {'进行中' if s.get('prefill_prog') else '空闲'}  实时 {fmt(s.get('prefill_tps'), '{:.0f}')} "
           f"| Benchmark {fmt(s.get('bench_prefill_tps'), '{:.0f}')} [{s.get('bench_prefill_mode') or '未测'}]")
     print(f"TTFT     : 官方 p50 {fmt(s.get('ttft_p50'), '{:.0f}')} ms / p95 {fmt(s.get('ttft_p95'), '{:.0f}')} ms "
           f"| Benchmark {fmt(s.get('bench_ttft_ms'), '{:.0f}')} ms (首个非空token)")
-    print(f"内存     : 引擎 {fmt((s.get('mem_cur') or 0)/2**30)} / {fmt((s.get('mem_lim') or 0)/2**30)} GB "
-          f"(峰值 {fmt((s.get('mem_peak') or 0)/2**30)})  引擎压力 {s.get('pressure_engine','?')} (官方)")
+    cur, lim, peak = s.get("mem_cur"), s.get("mem_lim"), s.get("mem_peak")
+    print(f"内存     : 引擎 {fmt(cur/2**30 if cur is not None else None)} / "
+          f"{fmt(lim/2**30 if lim is not None else None, '{:.0f}')} GB "
+          f"(峰值 {fmt(peak/2**30 if peak is not None else None)})  引擎压力 {s.get('pressure_engine','?')} (官方)")
     print(f"系统内存 : {fmt(used)} / {fmt(total, '{:.0f}')} GB  "
           f"系统free {sysps.get('free_pct','?')}% 压力等级未知(无公开API)  "
           f"Swap {fmt(sysps.get('swap_used_gb'))}/{fmt(sysps.get('swap_total_gb'), '{:.0f}')} GB")
@@ -543,7 +619,7 @@ def gui_mode(base):
     c.start()
 
     root = tk.Tk()
-    root.title("Splash Monitor v2")
+    root.title("Splash Monitor v1.0.0")
     root.configure(bg=DARK)
     root.geometry("720x420")
     root.minsize(640, 380)
@@ -645,7 +721,7 @@ def gui_mode(base):
 
             # Decode: 大字=实时(官方计数器差分), 小字只留 Benchmark
             d = s.get("decode_tps")
-            d_big.config(text=fmt(d) if d else "0.0")
+            d_big.config(text=fmt(d) if d is not None else ("0.0" if s.get("decode_valid") else "--"))
             d_sub.config(text=f"Bench {fmt(s.get('bench_decode_tps'))} [{s.get('bench_decode_mode') or '未测'}]")
             draw_line(d_cv, s["hist_decode"], ACCENT[0])
 
@@ -662,16 +738,18 @@ def gui_mode(base):
                 p_big.config(text=fmt(s["prefill_last"], "{:.0f}"))
                 p_sub.config(text=pf_bench)
             else:
-                p_big.config(text="0")
+                p_big.config(text="0" if s.get("prefill_valid") else "--")
                 p_sub.config(text=pf_bench)
             draw_line(p_cv, s["hist_prefill"], ACCENT[1], vmax=4000)
 
             # Memory: 大字=引擎当前/上限; 面积图=系统内存占用趋势(柔和绿);
             # 进度条=Splash 引擎配额占用, 与系统内存压力是两回事
             cur, lim = s.get("mem_cur"), s.get("mem_lim")
-            m_big.config(text=fmt((cur or 0) / 2**30) + f" / {fmt((lim or 0)/2**30, '{:.0f}')}")
+            peak = s.get("mem_peak")
+            m_big.config(text=(fmt(cur / 2**30) if cur is not None else "--")
+                         + f" / {fmt(lim / 2**30, '{:.0f}') if lim is not None else '--'}")
             used, total, _ = s.get("sysmem") or (None, None, None)
-            m_sub.config(text=f"占用峰值 {fmt((s.get('mem_peak') or 0)/2**30)} GB"
+            m_sub.config(text=f"占用峰值 {fmt(peak/2**30 if peak is not None else None)} GB"
                               f"  总占用 {fmt(used)}/{fmt(total,'{:.0f}')} GB")
             draw_area(m_cv, s["hist_sysmem"], G_EDGE, G_FILL, vmax=1.0)
             m_qcv.delete("all")
@@ -702,6 +780,9 @@ def gui_mode(base):
                                           f"TG {fmt(s.get('bench_decode_tps'))}  "
                                           f"PP {fmt(s.get('bench_prefill_tps'), '{:.0f}')}  "
                                           f"TTFT {fmt(s.get('bench_ttft_ms'), '{:.0f}')}ms")
+                elif s.get("bench_status"):
+                    # 首轮即失败(无成功时间戳): 失败原因也必须显示出来, 不能沉默
+                    bench_lbl.config(text=s["bench_status"])
         root.after(1000, refresh)
 
     root.after(1000, refresh)
